@@ -4,11 +4,13 @@ import json
 import time
 import random
 import socket
+import zlib
 import http.client
 from io import BytesIO
 from functools import wraps
 from typing import Optional, Tuple
 from src import info, silent_error, error, CF_IDENTIFIER, CF_API_TOKEN
+
 
 
 def cloudflare_gateway_request(
@@ -39,19 +41,34 @@ def cloudflare_gateway_request(
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
-        "Accept-Encoding": "gzip"
+        "Accept-Encoding": "gzip, deflate"
     }
 
     try:
         conn.request(method, url, body, headers)
         response = conn.getresponse()
         data = response.read()
+        content_encoding = response.getheader('Content-Encoding')
 
+        # Inline function to handle content encoding
         try:
-            # Decompress GZIP response data
-            data = gzip.GzipFile(fileobj=BytesIO(data)).read()
-        except OSError as e:
-            raise RuntimeError(f"Error during gzip decompression: {e}")
+            if content_encoding == 'gzip':
+                data = gzip.GzipFile(fileobj=BytesIO(data)).read()
+            elif content_encoding == 'deflate':
+                try:
+                    # Try to decompress with raw deflate
+                    data = zlib.decompress(data, -zlib.MAX_WBITS)
+                except zlib.error:
+                    # Fallback to standard deflate
+                    data = zlib.decompress(data)
+            elif content_encoding in (None, 'identity'):
+                # No compression or identity, return data as is
+                pass
+            else:
+                # Unsupported encoding
+                raise RuntimeError(f"Unsupported Content-Encoding: {content_encoding}")
+        except (OSError, zlib.error) as e:
+            raise RuntimeError(f"Error during decompression: {e}")
 
         if response.status >= 400:
             error_message = (
@@ -75,13 +92,14 @@ def cloudflare_gateway_request(
 def retry(func):
     """
     Decorator that retries the wrapped function up to 5 times with exponential backoff
-    in case of an exception.
-    
+    for non-429 errors. If a 429 error (Too Many Requests) is encountered, it will retry
+    indefinitely until successful, with increasing wait times.
+
     Args:
         func: Function to wrap.
-    
+
     Returns:
-        The result of the wrapped function or raises the exception if all attempts fail.
+        The result of the wrapped function or raises the exception if all attempts fail for non-429 errors.
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -91,13 +109,20 @@ def retry(func):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                silent_error(f"Attempt {attempt_number} failed with {e}. Retrying...")
+                # Check for specific 429 Too Many Requests error
+                if "429" in str(e):
+                    silent_error(f"Attempt {attempt_number} failed with 429 Too Many Requests. Retrying indefinitely...")
+                    # Increase the wait time exponentially with a cap at 30 seconds
+                    wait_time = min(2 ** (attempt_number - 1), 30)
+                else:
+                    silent_error(f"Attempt {attempt_number} failed with {e}. Retrying...")
 
-                if attempt_number >= 5:
-                    raise
+                    if attempt_number >= 5:
+                        raise
 
-                # Exponential backoff with randomness
-                wait_time = min(1 * (2 ** random.uniform(0, attempt_number - 1)), 10)
+                    # Exponential backoff with randomness for non-429 errors (maximum of 10 seconds)
+                    wait_time = min(2 ** (attempt_number - 1), 10) + random.uniform(0, 1)
+
                 silent_error(f"Sleeping for {wait_time:.2f} seconds before retrying...")
                 time.sleep(wait_time)
 
